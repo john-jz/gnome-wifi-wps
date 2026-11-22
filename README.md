@@ -3,6 +3,8 @@
 A GNOME Shell extension that adds WPS (Wi-Fi Protected Setup) push-button
 connect to Quick Settings.
 
+![Quick Settings showing the WPS entry and its popup menu](screenshot.png)
+
 ## Why
 
 GNOME Settings' Wi-Fi panel used to show a WPS option in the password dialog
