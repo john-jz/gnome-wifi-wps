@@ -37,8 +37,11 @@ class WpsToggle extends QuickSettings.QuickMenuToggle {
         this._device = null;
         this._apAddedId = 0;
         this._apRemovedId = 0;
+        this._destroyed = false;
 
         NM.Client.new_async(null, (obj, result) => {
+            if (this._destroyed)
+                return;
             try {
                 this._client = NM.Client.new_finish(result);
                 this._attachDevice();
@@ -67,6 +70,8 @@ class WpsToggle extends QuickSettings.QuickMenuToggle {
         this._showMessage(_('Scanning…'));
         try {
             this._device.request_scan_async(null, (dev, result) => {
+                if (this._destroyed)
+                    return;
                 try {
                     dev.request_scan_finish(result);
                 } catch (e) {
@@ -149,6 +154,7 @@ class WpsToggle extends QuickSettings.QuickMenuToggle {
     }
 
     destroy() {
+        this._destroyed = true;
         if (this._device) {
             if (this._apAddedId)
                 this._device.disconnect(this._apAddedId);
