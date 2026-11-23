@@ -16,51 +16,80 @@ function ssidToUtf8(ap) {
     return NM.utils_ssid_to_utf8(bytes.get_data());
 }
 
-// Walks NetworkManager's own list of access points (the public libnm API --
-// stable across GNOME versions) rather than anything private, so the only
-// private surface this touches is *locating the row widget* for an AP
-// GNOME already knows about.
-function wpsAccessPoints(device) {
-    return device.get_access_points().filter(ap => ap.get_flags() & AP_FLAGS.WPS);
+// Finds every actor carrying a `_network` property -- GNOME's own per-SSID
+// row widget (class `NMWirelessNetworkItem` as of GNOME 51, confirmed live
+// via Looking Glass). Its exact container nesting (a scroll view wrapping a
+// box layout) isn't documented, so this walks the actor tree rather than
+// assuming a fixed depth.
+function findNetworkRows(actor, out = []) {
+    if (!actor)
+        return out;
+    if (actor._network)
+        out.push(actor);
+    if (typeof actor.get_children === 'function') {
+        for (const child of actor.get_children())
+            findNetworkRows(child, out);
+    }
+    return out;
+}
+
+// Each row's `_network` wrapper holds `_accessPoints` as a Set of the real
+// NM.AccessPoint objects sharing that SSID (confirmed live: a plain Array
+// assumption breaks here, it is genuinely a Set).
+function wpsAccessPoint(network) {
+    for (const ap of network?._accessPoints ?? [])
+        if (ap.get_flags() & AP_FLAGS.WPS)
+            return ap;
+    return null;
 }
 
 // Adds a small "WPS" button onto the quick-settings row for any nearby
 // WPS-capable access point. This relies on GNOME Shell's private Wi-Fi
-// quick-settings internals (_wirelessToggle, _items, _networkItems,
-// checkAccessPoint()) -- not a documented extension API. Verified against
-// real, published extensions doing the same kind of thing (gse-disconnect-
-// wifi adds a per-row "Disconnect" button the same way; wifi-hotspot-quick-
-// settings uses the same InjectionManager pattern to attach to the
-// indicator). These property names can change on a future GNOME release
-// without notice -- every method here fails soft (no-ops) rather than
-// throwing into GNOME Shell's own code if something is missing.
+// quick-settings internals -- not a documented extension API. The property
+// names here were verified live (via Looking Glass) against this machine's
+// actual GNOME 51.1, not copied blind from older published extensions
+// (gse-disconnect-wifi, wifi-hotspot-quick-settings) that inspired the
+// approach -- their exact property names (`_networkItems` as a Map) turned
+// out to already be stale here (`_networks`, an Array, plus a `_network`
+// back-reference on each row widget). Every access point below fails soft
+// (no-ops) rather than throwing if something is missing, so a future GNOME
+// release renaming something again just means no WPS buttons appear, not a
+// broken Wi-Fi menu.
 class WpsRowController {
     constructor() {
-        this._buttons = new Map(); // apMenuItem -> button
+        this._buttons = new Map(); // row actor -> button
         this._hookedDevices = new Set();
-        this._deviceSignalIds = new Map(); // device -> [signal ids]
+        this._deviceSignalIds = new Map();
         this._clientSignalId = 0;
+        this._menuOpenId = 0;
     }
 
     attachIndicator(indicator) {
-        this._indicator = indicator;
         this._client = indicator?._client;
         const toggle = indicator?._wirelessToggle;
         if (!toggle || !this._client)
             return;
-
         this._toggle = toggle;
 
         try {
             this._clientSignalId = this._client.connect('device-added',
                 (client, device) => this._hookDevice(device));
-        } catch (e) {
-            // Non-fatal -- devices added after this point just won't get a
-            // WPS button until the next enable()/disable() cycle.
-        }
+        } catch (e) { /* non-fatal -- hot-plugged devices just won't get a button */ }
+
+        try {
+            this._menuOpenId = toggle.menu?.connect('open-state-changed', (menu, open) => {
+                if (open)
+                    this._syncAll();
+            });
+        } catch (e) { /* non-fatal -- see first-sync fallback below */ }
 
         for (const device of toggle._nmDevices ?? [])
             this._hookDevice(device);
+    }
+
+    _syncAll() {
+        for (const device of this._hookedDevices)
+            this._syncDevice(device);
     }
 
     _hookDevice(device) {
@@ -81,36 +110,33 @@ class WpsRowController {
 
     _syncDevice(device) {
         const menuItem = this._toggle?._items?.get(device);
-        if (!menuItem?._networkItems)
+        const box = menuItem?._mainSection?.box;
+        if (!box)
             return;
 
-        const entries = [...menuItem._networkItems.entries()];
-        const wpsAps = wpsAccessPoints(device);
+        const rows = findNetworkRows(box);
+        const liveRows = new Set(rows);
 
-        // Drop buttons whose AP is gone or no longer WPS-capable.
-        for (const [apMenuItem, button] of [...this._buttons]) {
-            const entry = entries.find(([, item]) => item === apMenuItem);
-            const stillWps = entry && wpsAps.some(ap => entry[0].checkAccessPoint(ap));
-            if (!stillWps) {
+        // Drop buttons whose row is gone (GNOME rebuilds this list whenever
+        // the AP scan results change).
+        for (const [row, button] of [...this._buttons]) {
+            if (!liveRows.has(row)) {
                 button.destroy();
-                this._buttons.delete(apMenuItem);
+                this._buttons.delete(row);
             }
         }
 
-        // Add a button for each WPS-capable AP that doesn't have one yet.
-        for (const ap of wpsAps) {
-            const entry = entries.find(([network]) => network.checkAccessPoint(ap));
-            if (!entry)
+        for (const row of rows) {
+            if (this._buttons.has(row))
                 continue;
-            const [, apMenuItem] = entry;
-            if (this._buttons.has(apMenuItem))
+            const ap = wpsAccessPoint(row._network);
+            if (!ap)
                 continue;
-
-            this._addButton(apMenuItem, device, ap);
+            this._addButton(row, device, ap);
         }
     }
 
-    _addButton(apMenuItem, device, ap) {
+    _addButton(row, device, ap) {
         let button;
         try {
             button = new QuickSettingsItem({
@@ -126,19 +152,23 @@ class WpsRowController {
 
         button.connect('clicked', () => this._connect(device, ap));
 
-        const destroyId = apMenuItem.connect('destroy', () => {
-            this._buttons.delete(apMenuItem);
+        const destroyId = row.connect('destroy', () => {
+            this._buttons.delete(row);
         });
-        button.connect('destroy', () => apMenuItem.disconnect(destroyId));
+        button.connect('destroy', () => {
+            try {
+                row.disconnect(destroyId);
+            } catch (e) { /* row may already be gone */ }
+        });
 
         try {
-            apMenuItem.add_child(button);
+            row.add_child(button);
         } catch (e) {
             button.destroy();
             return;
         }
 
-        this._buttons.set(apMenuItem, button);
+        this._buttons.set(row, button);
     }
 
     _connect(device, ap) {
@@ -174,6 +204,13 @@ class WpsRowController {
     }
 
     destroy() {
+        if (this._menuOpenId && this._toggle?.menu) {
+            try {
+                this._toggle.menu.disconnect(this._menuOpenId);
+            } catch (e) { /* menu may already be gone */ }
+        }
+        this._menuOpenId = 0;
+
         if (this._clientSignalId && this._client) {
             try {
                 this._client.disconnect(this._clientSignalId);
