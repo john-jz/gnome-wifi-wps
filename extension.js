@@ -1,11 +1,11 @@
-import GObject from 'gi://GObject';
 import NM from 'gi://NM';
+import Clutter from 'gi://Clutter';
 
 import * as Main from 'resource:///org/gnome/shell/ui/main.js';
-import * as QuickSettings from 'resource:///org/gnome/shell/ui/quickSettings.js';
-import * as PopupMenu from 'resource:///org/gnome/shell/ui/popupMenu.js';
+import * as Network from 'resource:///org/gnome/shell/ui/status/network.js';
+import {QuickSettingsItem} from 'resource:///org/gnome/shell/ui/quickSettings.js';
 
-import {Extension, gettext as _} from 'resource:///org/gnome/shell/extensions/extension.js';
+import {Extension, InjectionManager, gettext as _} from 'resource:///org/gnome/shell/extensions/extension.js';
 
 const AP_FLAGS = NM['80211ApFlags'];
 
@@ -16,114 +16,134 @@ function ssidToUtf8(ap) {
     return NM.utils_ssid_to_utf8(bytes.get_data());
 }
 
-const WpsToggle = GObject.registerClass(
-class WpsToggle extends QuickSettings.QuickMenuToggle {
-    _init() {
-        super._init({
-            title: _('WPS'),
-            iconName: 'network-wireless-symbolic',
-            toggleMode: false,
-        });
+// Walks NetworkManager's own list of access points (the public libnm API --
+// stable across GNOME versions) rather than anything private, so the only
+// private surface this touches is *locating the row widget* for an AP
+// GNOME already knows about.
+function wpsAccessPoints(device) {
+    return device.get_access_points().filter(ap => ap.get_flags() & AP_FLAGS.WPS);
+}
 
-        this.menu.setHeader('network-wireless-symbolic', _('Wi-Fi WPS'),
-            _('Connect to a network via its WPS button'));
-
-        this._itemsSection = new PopupMenu.PopupMenuSection();
-        this.menu.addMenuItem(this._itemsSection);
-        this.menu.addMenuItem(new PopupMenu.PopupSeparatorMenuItem());
-        this.menu.addAction(_('Rescan'), () => this._rescan());
-
-        this._client = null;
-        this._device = null;
-        this._apAddedId = 0;
-        this._apRemovedId = 0;
-        this._destroyed = false;
-
-        NM.Client.new_async(null, (obj, result) => {
-            if (this._destroyed)
-                return;
-            try {
-                this._client = NM.Client.new_finish(result);
-                this._attachDevice();
-                this._refresh();
-            } catch (e) {
-                logError(e, 'wifi-wps: failed to connect to NetworkManager');
-                this._showMessage(_('Could not reach NetworkManager'));
-            }
-        });
+// Adds a small "WPS" button onto the quick-settings row for any nearby
+// WPS-capable access point. This relies on GNOME Shell's private Wi-Fi
+// quick-settings internals (_wirelessToggle, _items, _networkItems,
+// checkAccessPoint()) -- not a documented extension API. Verified against
+// real, published extensions doing the same kind of thing (gse-disconnect-
+// wifi adds a per-row "Disconnect" button the same way; wifi-hotspot-quick-
+// settings uses the same InjectionManager pattern to attach to the
+// indicator). These property names can change on a future GNOME release
+// without notice -- every method here fails soft (no-ops) rather than
+// throwing into GNOME Shell's own code if something is missing.
+class WpsRowController {
+    constructor() {
+        this._buttons = new Map(); // apMenuItem -> button
+        this._hookedDevices = new Set();
+        this._deviceSignalIds = new Map(); // device -> [signal ids]
+        this._clientSignalId = 0;
     }
 
-    _attachDevice() {
-        const device = this._client.get_devices().find(
-            d => d.get_device_type() === NM.DeviceType.WIFI);
-        if (!device)
+    attachIndicator(indicator) {
+        this._indicator = indicator;
+        this._client = indicator?._client;
+        const toggle = indicator?._wirelessToggle;
+        if (!toggle || !this._client)
             return;
 
-        this._device = device;
-        this._apAddedId = device.connect('access-point-added', () => this._refresh());
-        this._apRemovedId = device.connect('access-point-removed', () => this._refresh());
-    }
+        this._toggle = toggle;
 
-    _rescan() {
-        if (!this._device)
-            return;
-        this._showMessage(_('Scanning…'));
         try {
-            this._device.request_scan_async(null, (dev, result) => {
-                if (this._destroyed)
-                    return;
-                try {
-                    dev.request_scan_finish(result);
-                } catch (e) {
-                    // Already scanning, or scan throttled -- not fatal, the
-                    // access-point-added signal still fires for new results.
-                }
-                this._refresh();
+            this._clientSignalId = this._client.connect('device-added',
+                (client, device) => this._hookDevice(device));
+        } catch (e) {
+            // Non-fatal -- devices added after this point just won't get a
+            // WPS button until the next enable()/disable() cycle.
+        }
+
+        for (const device of toggle._nmDevices ?? [])
+            this._hookDevice(device);
+    }
+
+    _hookDevice(device) {
+        if (!device || device.get_device_type?.() !== NM.DeviceType.WIFI)
+            return;
+        if (this._hookedDevices.has(device))
+            return;
+        this._hookedDevices.add(device);
+
+        const refresh = () => this._syncDevice(device);
+        const ids = [
+            device.connect('access-point-added', refresh),
+            device.connect('access-point-removed', refresh),
+        ];
+        this._deviceSignalIds.set(device, ids);
+        refresh();
+    }
+
+    _syncDevice(device) {
+        const menuItem = this._toggle?._items?.get(device);
+        if (!menuItem?._networkItems)
+            return;
+
+        const entries = [...menuItem._networkItems.entries()];
+        const wpsAps = wpsAccessPoints(device);
+
+        // Drop buttons whose AP is gone or no longer WPS-capable.
+        for (const [apMenuItem, button] of [...this._buttons]) {
+            const entry = entries.find(([, item]) => item === apMenuItem);
+            const stillWps = entry && wpsAps.some(ap => entry[0].checkAccessPoint(ap));
+            if (!stillWps) {
+                button.destroy();
+                this._buttons.delete(apMenuItem);
+            }
+        }
+
+        // Add a button for each WPS-capable AP that doesn't have one yet.
+        for (const ap of wpsAps) {
+            const entry = entries.find(([network]) => network.checkAccessPoint(ap));
+            if (!entry)
+                continue;
+            const [, apMenuItem] = entry;
+            if (this._buttons.has(apMenuItem))
+                continue;
+
+            this._addButton(apMenuItem, device, ap);
+        }
+    }
+
+    _addButton(apMenuItem, device, ap) {
+        let button;
+        try {
+            button = new QuickSettingsItem({
+                style_class: 'button',
+                can_focus: true,
+                icon_name: 'network-wireless-symbolic',
+                label: _('WPS'),
+                x_align: Clutter.ActorAlign.END,
             });
         } catch (e) {
-            logError(e, 'wifi-wps: rescan failed');
-        }
-    }
-
-    _showMessage(text) {
-        this._itemsSection.removeAll();
-        const item = new PopupMenu.PopupMenuItem(text);
-        item.setSensitive(false);
-        this._itemsSection.addMenuItem(item);
-    }
-
-    _refresh() {
-        if (!this._device) {
-            this._showMessage(_('No Wi-Fi device found'));
             return;
         }
 
-        const bySsid = new Map();
-        for (const ap of this._device.get_access_points()) {
-            const flags = ap.get_flags();
-            if (!(flags & AP_FLAGS.WPS))
-                continue;
-            const ssid = ssidToUtf8(ap);
-            if (!ssid || bySsid.has(ssid))
-                continue;
-            bySsid.set(ssid, ap);
-        }
+        button.connect('clicked', () => this._connect(device, ap));
 
-        if (bySsid.size === 0) {
-            this._showMessage(_('No WPS-capable networks nearby'));
+        const destroyId = apMenuItem.connect('destroy', () => {
+            this._buttons.delete(apMenuItem);
+        });
+        button.connect('destroy', () => apMenuItem.disconnect(destroyId));
+
+        try {
+            apMenuItem.add_child(button);
+        } catch (e) {
+            button.destroy();
             return;
         }
 
-        this._itemsSection.removeAll();
-        for (const [ssid, ap] of bySsid) {
-            const item = new PopupMenu.PopupMenuItem(
-                _('%s — push the router’s WPS button').format(ssid));
-            item.connect('activate', () => this._connect(ssid, ap));
-            this._itemsSection.addMenuItem(item);
-        }
+        this._buttons.set(apMenuItem, button);
     }
 
-    _connect(ssid, ap) {
+    _connect(device, ap) {
+        const ssid = ssidToUtf8(ap) ?? _('network');
+
         const connection = new NM.SimpleConnection();
         connection.add_setting(new NM.SettingConnection({
             type: '802-11-wireless',
@@ -141,7 +161,7 @@ class WpsToggle extends QuickSettings.QuickMenuToggle {
             _('Press the WPS button on the router now (you have about 2 minutes)'));
 
         this._client.add_and_activate_connection_async(
-            connection, this._device, ap.get_path(), null,
+            connection, device, ap.get_path(), null,
             (client, result) => {
                 try {
                     client.add_and_activate_connection_finish(result);
@@ -154,39 +174,56 @@ class WpsToggle extends QuickSettings.QuickMenuToggle {
     }
 
     destroy() {
-        this._destroyed = true;
-        if (this._device) {
-            if (this._apAddedId)
-                this._device.disconnect(this._apAddedId);
-            if (this._apRemovedId)
-                this._device.disconnect(this._apRemovedId);
+        if (this._clientSignalId && this._client) {
+            try {
+                this._client.disconnect(this._clientSignalId);
+            } catch (e) { /* client may already be gone */ }
         }
-        super.destroy();
-    }
-});
+        this._clientSignalId = 0;
 
-const WpsIndicator = GObject.registerClass(
-class WpsIndicator extends QuickSettings.SystemIndicator {
-    _init() {
-        super._init();
-        this._toggle = new WpsToggle();
-        this.quickSettingsItems.push(this._toggle);
-    }
+        for (const [device, ids] of this._deviceSignalIds) {
+            for (const id of ids) {
+                try {
+                    device.disconnect(id);
+                } catch (e) { /* device may already be gone */ }
+            }
+        }
+        this._deviceSignalIds.clear();
+        this._hookedDevices.clear();
 
-    destroy() {
-        this.quickSettingsItems.forEach(item => item.destroy());
-        super.destroy();
+        for (const button of this._buttons.values())
+            button.destroy();
+        this._buttons.clear();
     }
-});
+}
 
 export default class WifiWpsExtension extends Extension {
     enable() {
-        this._indicator = new WpsIndicator();
-        Main.panel.statusArea.quickSettings.addExternalIndicator(this._indicator);
+        this._injectionManager = new InjectionManager();
+        this._controller = new WpsRowController();
+
+        const controller = this._controller;
+        this._injectionManager.overrideMethod(
+            Network.Indicator.prototype, '_init',
+            originalMethod => {
+                return function (...args) {
+                    const result = originalMethod.call(this, ...args);
+                    controller.attachIndicator(this);
+                    return result;
+                };
+            }
+        );
+
+        const indicator = Main.panel.statusArea.quickSettings?._network;
+        if (indicator)
+            this._controller.attachIndicator(indicator);
     }
 
     disable() {
-        this._indicator?.destroy();
-        this._indicator = null;
+        this._injectionManager?.clear();
+        this._injectionManager = null;
+
+        this._controller?.destroy();
+        this._controller = null;
     }
 }

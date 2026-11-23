@@ -1,9 +1,8 @@
 # Wi-Fi WPS
 
 A GNOME Shell extension that adds WPS (Wi-Fi Protected Setup) push-button
-connect to Quick Settings.
-
-![Quick Settings showing the WPS entry and its popup menu](screenshot.png)
+connect directly onto GNOME's own Wi-Fi quick-settings network list — no
+separate menu, no separate tile.
 
 ## Why
 
@@ -14,22 +13,44 @@ and `libnma`/`libnma-gtk4` have no WPS code paths at all (checked directly:
 no WPS-related strings anywhere in those binaries). `nm-applet`'s classic tray
 dialog still has it, but GNOME has no system tray by default.
 
-This extension fills that gap natively in Quick Settings, using NetworkManager's
-own `libnm` (no shelling out to `nmcli`/`wpa_cli`, no extra daemons).
+This extension fills that gap in place, inside the real Wi-Fi network list,
+using NetworkManager's own `libnm` (no shelling out to `nmcli`/`wpa_cli`, no
+extra daemons).
 
 ## What it does
 
-- Adds a "WPS" entry to Quick Settings.
-- Lists currently-visible access points that advertise WPS support (detected
-  via `NM.AccessPoint`'s `80211ApFlags.WPS` flag — the same mechanism
-  NetworkManager itself uses internally).
-- Clicking an entry creates a connection profile with
-  `wps-method = pbc` and activates it, then shows a notification telling you
-  to press the physical WPS button on that router within the ~2 minute window.
+- Scans the Wi-Fi quick-settings list (the one you get by clicking the Wi-Fi
+  tile) for access points that advertise WPS support, detected via
+  `NM.AccessPoint`'s `80211ApFlags.WPS` flag — the same mechanism
+  NetworkManager itself uses internally.
+- Adds a small "WPS" button directly onto that access point's row.
+- Clicking it creates a connection profile with `wps-method = pbc` and
+  activates it, then shows a notification telling you to press the physical
+  WPS button on that router within the ~2 minute window.
 
 PIN-method WPS isn't exposed in the UI — push-button is nearly universal on
 real hardware, and surfacing a PIN well (generating one, displaying it, timing
 it against the router's own admin UI) needs more UX than a first cut over.
+
+## How it integrates with the native Wi-Fi menu
+
+GNOME Shell doesn't expose a documented extension point for adding to its
+built-in Wi-Fi list, so this uses `InjectionManager` (GNOME's own supported
+tool for safely overriding built-in Shell methods) to hook
+`Main.panel.statusArea.quickSettings._network`'s private internals
+(`_wirelessToggle`, `_items`, `_networkItems`, `checkAccessPoint()`) and
+attach a button onto the row for each WPS-capable AP. This pattern mirrors
+real published extensions that do the same kind of thing — e.g.
+[gse-disconnect-wifi](https://github.com/kgshank/gse-disconnect-wifi) adds a
+per-row "Disconnect" button the same way, and
+[wifi-hotspot-quick-settings](https://github.com/Aryan10/wifi-hotspot-quick-settings)
+uses the same `InjectionManager` attach pattern.
+
+**This is private API, not a stable one.** Those property names aren't part
+of any documented extension contract and can change on any GNOME release
+without notice. Every private-property access here fails soft (no-ops
+instead of throwing) specifically so a future GNOME update that renames
+something just means no WPS buttons appear — not a broken Wi-Fi menu.
 
 ## Requirements
 

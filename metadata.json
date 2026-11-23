@@ -1,6 +1,6 @@
 {
   "name": "Wi-Fi WPS",
-  "description": "Adds a Quick Settings entry that lists nearby WPS-capable Wi-Fi networks and connects to them with a push-button tap — no password typing. Fills a gap left by GNOME Settings' GTK4 network panel, which dropped WPS support.",
+  "description": "Adds a WPS push-button-connect button directly onto WPS-capable networks in GNOME's own Wi-Fi quick-settings list — no password typing. Fills a gap left by GNOME Settings' GTK4 network panel, which dropped WPS support.",
   "uuid": "wifi-wps@john-jz.github.io",
   "shell-version": ["48", "49", "50", "51"],
   "url": "https://github.com/john-jz/gnome-wifi-wps"
