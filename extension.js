@@ -1,5 +1,6 @@
 import NM from 'gi://NM';
 import Clutter from 'gi://Clutter';
+import GLib from 'gi://GLib';
 
 import * as Main from 'resource:///org/gnome/shell/ui/main.js';
 import * as Network from 'resource:///org/gnome/shell/ui/status/network.js';
@@ -64,11 +65,18 @@ class WpsRowController {
         this._menuOpenId = 0;
     }
 
+    // Returns whether the attach actually succeeded. `indicator._client` is
+    // populated asynchronously (NM.Client.new_async), so right after the
+    // indicator object exists, `_client`/`_wirelessToggle` can still be
+    // unset -- a single synchronous attempt at enable() time can run before
+    // they're ready and then never retry. Callers poll this.
     attachIndicator(indicator) {
+        if (this._toggle)
+            return true;
         this._client = indicator?._client;
         const toggle = indicator?._wirelessToggle;
         if (!toggle || !this._client)
-            return;
+            return false;
         this._toggle = toggle;
 
         try {
@@ -85,6 +93,8 @@ class WpsRowController {
 
         for (const device of toggle._nmDevices ?? [])
             this._hookDevice(device);
+
+        return true;
     }
 
     _syncAll() {
@@ -251,12 +261,38 @@ export default class WifiWpsExtension extends Extension {
             }
         );
 
-        const indicator = Main.panel.statusArea.quickSettings?._network;
-        if (indicator)
-            this._controller.attachIndicator(indicator);
+        this._tryAttach();
+    }
+
+    // The quick-settings Wi-Fi indicator already exists at enable() time
+    // (created once, at Shell startup) but its `_client`/`_wirelessToggle`
+    // are filled in asynchronously (NM.Client.new_async), so a single
+    // synchronous attach attempt right here can run too early and then
+    // never retry -- this polls every second until it succeeds.
+    _tryAttach() {
+        const attempt = () => {
+            const indicator = Main.panel.statusArea.quickSettings?._network;
+            return !!(indicator && this._controller?.attachIndicator(indicator));
+        };
+
+        if (attempt())
+            return;
+
+        this._retrySourceId = GLib.timeout_add_seconds(GLib.PRIORITY_DEFAULT, 1, () => {
+            if (attempt()) {
+                this._retrySourceId = 0;
+                return GLib.SOURCE_REMOVE;
+            }
+            return GLib.SOURCE_CONTINUE;
+        });
     }
 
     disable() {
+        if (this._retrySourceId) {
+            GLib.source_remove(this._retrySourceId);
+            this._retrySourceId = 0;
+        }
+
         this._injectionManager?.clear();
         this._injectionManager = null;
 
