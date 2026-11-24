@@ -1,10 +1,10 @@
 import NM from 'gi://NM';
 import Clutter from 'gi://Clutter';
 import GLib from 'gi://GLib';
+import St from 'gi://St';
 
 import * as Main from 'resource:///org/gnome/shell/ui/main.js';
 import * as Network from 'resource:///org/gnome/shell/ui/status/network.js';
-import {QuickSettingsItem} from 'resource:///org/gnome/shell/ui/quickSettings.js';
 
 import {Extension, InjectionManager, gettext as _} from 'resource:///org/gnome/shell/extensions/extension.js';
 
@@ -146,15 +146,29 @@ class WpsRowController {
         }
     }
 
+    // A plain St.Button with the stock `icon-button` style class -- the same
+    // widget/class GNOME itself uses for a small icon-only action embedded
+    // in an otherwise-hoverable row (e.g. the message-expand/close buttons
+    // inside a notification's header, in messageList.js). `QuickSettingsItem`
+    // (really just St.Button with an optional attached menu) was tried first
+    // but its default `button` style class is sized/colored for a standalone
+    // quick-toggle tile, not an inline accessory -- and setting `can_focus`
+    // left a focus ring that never gets cleared by mouse movement alone
+    // (nothing else in this popup ever steals keyboard focus back), which
+    // is what looked like "stays highlighted after the mouse moves away".
+    // `x_expand: true` is required for `x_align: END` to do anything at all:
+    // Clutter.BoxLayout only honors a child's own alignment once that child
+    // is also marked to receive the row's leftover space.
     _addButton(row, device, ap) {
         let button;
         try {
-            button = new QuickSettingsItem({
-                style_class: 'button',
-                can_focus: true,
-                icon_name: 'network-wireless-symbolic',
-                label: _('WPS'),
+            button = new St.Button({
+                style_class: 'icon-button',
+                icon_name: 'network-wireless-acquiring-symbolic',
+                accessible_name: _('Connect via WPS'),
+                y_align: Clutter.ActorAlign.CENTER,
                 x_align: Clutter.ActorAlign.END,
+                x_expand: true,
             });
         } catch (e) {
             return;
